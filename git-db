@@ -1,0 +1,563 @@
+#!/bin/bash
+# TEMPLATE_VERSION=2024-04-25
+
+# Basic bash template for command/resource based CLI.
+# Features:
+# * Automatic command discovery and help generation
+# * Logging and traces
+# * Application dependency checker
+# * Support for getopts
+# * Return code support
+# * Command executor with dry mode
+
+set -euo pipefail
+
+# App Global variable
+# =================
+
+APP_NAME="git-db"
+APP_AUTHOR="mrjk"
+APP_EMAIL="mrjk.78 at gmail.com"
+APP_LICENSE="GPLv3"
+APP_URL="https://github.com/$APP_AUTHOR/$APP_NAME"
+APP_REPO="https://github.com/$APP_AUTHOR/$APP_NAME.git"
+APP_GIT="git@github.com:$APP_AUTHOR/$APP_NAME.git"
+
+APP_STATUS=stable
+APP_DATE="2024-08-17"
+APP_VERSION=0.0.3
+
+#APP_DEPENDENCIES="column tree htop"
+APP_LOG_SCALE="TRACE:DEBUG:RUN:INFO:DRY:HINT:NOTICE:CMD:USER:WARN:ERR:ERROR:CRIT:TODO:DIE"
+
+APP_DRY=${APP_DRY:-false}
+APP_FORCE=${APP_FORCE:-false}
+APP_LOG_LEVEL=INFO
+#APP_LOG_LEVEL=DRY
+#APP_LOG_LEVEL=DEBUG
+
+
+# CLI libraries
+# =================
+
+_log ()
+{
+  local lvl="${1:-DEBUG}"
+  shift 1 || true
+
+  # Check log level filter
+  if [[ ! ":${APP_LOG_SCALE#*$APP_LOG_LEVEL:}:$APP_LOG_LEVEL:" =~ :"$lvl": ]]; then
+    if [[ ! ":${APP_LOG_SCALE}" =~ :"$lvl": ]]; then
+      >&2 printf "%s\n" "  BUG: Unknown log level: $lvl"
+    else
+      return 0
+    fi
+  fi
+
+  local msg=${*}
+  if [[ "$msg" == '-' ]]; then
+    msg="$(cat - )"
+  fi
+  while read -r -u 3 line; do
+    >&2 printf "%5s: %s\\n" "$lvl" "${line:- }"
+  done 3<<<"$msg"
+}
+
+_die ()
+{
+    local rc=${1:-1}
+    shift 1 || true
+    local msg="${*:-}"
+    if [[ -z "$msg" ]]; then
+      [ "$rc" -ne 0 ] || exit 0
+      _log DIE "Program terminated with error: $rc"
+    else
+      _log DIE "$msg"
+    fi
+
+    # Remove EXIT trap and exit nicely
+    trap '' EXIT
+    exit "$rc"
+}
+
+_exec ()
+{
+  local cmd=( "$@" )
+  if ${APP_DRY:-false}; then
+    _log DRY "  | ${cmd[@]}"
+  else
+    _log RUN "  | ${cmd[@]}"
+    "${cmd[@]}"
+  fi
+}   
+
+_check_bin ()
+{
+  local cmd cmds="${*:-}"
+  for cmd in $cmds; do
+    command -v "$1" >&/dev/null || return 1
+  done
+}
+
+# shellcheck disable=SC2120 # Argument is optional by default
+_sh_trace ()
+{
+  local msg="${*}"
+
+  (
+    >&2 printf "%s\n" "TRACE: line, function, file"
+    for i in {0..10}; do
+      trace=$(caller "$i" 2>&1 || true )
+      if [ -z "$trace" ] ; then
+        continue
+      else
+        printf "%s\n" "$trace"
+      fi
+    done | tac | head -n -1
+    [ -z "$msg" ] || >&2 printf "%s\n" "TRACE: Bash trace: $msg"
+  )
+}
+
+# Usage: trap '_sh_trap_error $? ${LINENO} trap_exit 42' EXIT
+_sh_trap_error () {
+    local rc=$1
+    [[ "$rc" -ne 0 ]] || return 0
+    local line="$2"
+    local msg="${3-}"
+    local code="${4:-1}"
+    set +x
+
+    _log ERR "Uncatched bug:"
+    _sh_trace # | _log TRACE -
+    if [[ -n "$msg" ]] ; then
+      _log ERR "Error on or near line ${line}: ${msg}; got status ${rc}"
+    else
+      _log ERR "Error on or near line ${line}; got status ${rc}"
+    fi
+    exit "${code}"
+}
+
+# CLI helpers
+# =================
+
+# Dispatch command
+clish_dispatch ()
+{
+  local prefix=$1
+  local cmd=${2-}
+  shift 2 || true
+  [ ! -z "$cmd" ] || _die 3 "Missing command name, please check usage"
+
+  if [[ $(type -t "${prefix}${cmd}") == function ]]; then
+    "${prefix}${cmd}" "$@"
+  else
+    _log ERROR "Unknown command for ${prefix%%_?}: $cmd"
+    return 3
+  fi
+}
+
+
+# Parse command options
+# Called function must return an args array with remaining args
+clish_parse_opts ()
+{
+  local func=$1
+  shift
+  clish_dispatch "$func" _options "$@"
+}
+
+# Read CLI options for a given function/command
+# Options must be in a case statement and surounded by
+# 'parse-opt-start' and 'parse-opt-stop' strings. Returns
+# a list of value separated by ,. Fields are:
+clish_help_options ()
+{
+  local func=$1
+  local data=
+
+  # Check where to look options function
+  if declare -f "${func}_options" >/dev/null; then
+    func="${func}_options"
+    data=$(declare -f "$func")
+    data=$(printf "%s\n%s\n" 'parse-opt-start' "$data" )
+  else
+    data=$(declare -f "$func")
+  fi
+
+  # declare -f ${func} \
+  echo "$data" | awk '/parse-opt-start/,/parse-opt-stop/ {print}' \
+    | grep --no-group-separator -A 1 -E '^ *--?[a-zA-Z0-9].*)$' \
+    | sed -E '/\)$/s@[ \)]@@g;s/.*: "//;s/";//' \
+    | xargs -n2 -d'\n' \
+    | sed 's/ /,/;/^$/d'
+}
+
+# List all available commands starting with prefix
+clish_help_subcommands ()
+{
+  local prefix=${1:-cli__}
+  declare -f \
+    | grep -E -A 2 '^'"$prefix"'[a-z0-9]*(__[a-z0-9]*)*? \(\)' \
+    | sed '/{/d;/--/d;s/'"$prefix"'//;s/ ()/,/;s/";$//;s/^  *: "//;' \
+    | xargs -n2 -d'\n' \
+    | sed 's/, */,/;s/__/ /g;/,,$/d'
+}
+
+# Show help message of a function
+clish_help_msg ()
+{
+  local func=$1
+  clish_dispatch "$func" _usage 2>/dev/null || true
+}
+
+
+# Show cli usage for a given command
+clish_help ()
+{
+  : ",Show this help"
+  local func=${1:-cli}
+  local commands= options= message= output=
+
+  # Help message
+  message=$(clish_help_msg $func)
+
+  # Fetch command options
+  options=$(
+    while IFS=, read -r flags meta desc _; do
+      if [ ! -z "${flags:-}" ]; then
+        printf "  %-16s  %-20s  %s\n" "$flags" "$meta" "$desc"
+      fi
+    done <<< "$(clish_help_options $func)"
+  )
+
+  # Fetch sub command informations
+  commands=$(
+    while IFS=, read -r flags meta desc _; do
+      if [ ! -z "${flags:-}" ]; then
+        printf "  %-16s  %-20s  %s\n" "$flags" "$meta" "$desc"
+      fi
+    done <<< "$(clish_help_subcommands ${func}__)"
+  )
+
+  # Display help message
+  printf "%s\n" "${message:+$message}
+${commands:+
+commands:
+$commands}
+${options:+
+options:
+$options
+}"
+
+  # Append extra infos
+  if ! [[ "$func" == *"_"* ]]; then
+    cat <<EOF
+examples:
+  $APP_NAME init .
+  $APP_NAME set cars.steering 1
+  $APP_NAME add cars.wheels front-left
+  $APP_NAME add cars.wheels front-right
+  $APP_NAME dump
+  $APP_NAME set cars.wheels removed
+  $APP_NAME add cars.red_car.owner mrjk
+  $APP_NAME add cars.blue_car.status broken
+
+info:
+  author: $APP_AUTHOR ${APP_EMAIL:+<$APP_EMAIL>}
+  version: ${APP_VERSION:-0.0.1}-${APP_STATUS:-beta}${APP_DATE:+ ($APP_DATE)}
+  license: ${APP_LICENSE:-MIT}
+  website: ${APP_URL}
+EOF
+  fi
+
+}
+
+
+# Internal libreary
+# =================
+
+
+_db ()
+{
+  local file=$1
+  shift 1
+  _exec /usr/bin/git config --file "$file" "$@"
+}
+
+db_init ()
+{
+  export GITDB_FILE=$1
+}
+
+db_create ()
+{
+  local target_file= target_dir=
+
+  # Parse arg
+  if [[ "$#" -eq 0 ]]; then
+    target_file=${APP_DB_PATH}
+    target_dir=${target_file%/*}
+  else
+    if [[ -d "$1" ]]; then
+      target_dir="$1"
+      target_file=${APP_DB_NAME}
+    elif [ -w "$1" ]; then
+      target_dir=$(dirname "$1")
+      target_file=$(basename "$1")
+    elif [[ "$1" == */ ]]; then
+      target_dir="$1"
+      target_file=${APP_DB_NAME}
+    else
+      target_dir=$(dirname "$1")
+      target_file=$(basename "$1")
+    fi
+  fi
+  _log INFO "Create new database '${target_file}' in: $target_dir"
+
+  # Cleanup dest path
+  target_dir=${target_dir%/}
+  if [[ "$target_dir" != "$target_file" ]]; then
+    # Create parent
+    [[ -d "$target_dir" ]] || {
+      _log INFO "Create parent directory: $target_dir"
+      mkdir -p "$target_dir"
+    }
+  fi
+
+  target_path="$target_dir/$target_file"
+  if [[ -f "$target_path" ]]; then
+    _log INFO "Database already exists: $target_path"
+  else
+    _log INFO "Database has been created: $target_path"
+    touch "$target_path"
+    echo "# Created with $APP_NAME, on $(date)" >> "$target_path"
+  fi
+}
+
+db_set ()
+{
+  local key=$1
+  shift 1
+  _db "$GITDB_FILE" --replace-all "$key" "$@"
+}
+
+db_rm ()
+{
+  local key=$1
+  shift 1
+  _db "$GITDB_FILE" --unset-all $key "$@"
+}
+
+db_add ()
+{
+  local key=$1
+  shift 1
+  _db "$GITDB_FILE" --add "$key" "$@"
+}
+
+db_get ()
+{
+  local key=$1
+  shift 1
+  _db "$GITDB_FILE" --get-all "$key"
+}
+
+db_dump ()
+{
+  local pattern="${1:-.*}"
+  _db "$GITDB_FILE" --list | grep "^$pattern"
+}
+
+# ---- section managhement
+
+db_list_sections ()
+{
+  local filter=${@:-.*}
+
+  _db "$GITDB_FILE" --list --name-only | sed -E  's/\.[^\.]+$//' | sort -u | grep -E "$filter"
+}
+
+
+# Core App
+# =================
+
+### CLI INTERFACE
+cli__add()
+{
+  : "KEY VALUE,Add values to key"
+  db_add "$@"
+}
+cli__rm()
+{
+  : "KEY [VALUE],Delete key or specific key values"
+  db_rm "$@"
+}
+cli__set()
+{
+  : "KEY VALUE,Set value to key values"
+  db_set "$@"
+}
+cli__get()
+{
+  : "KEY,Get key values"
+  db_get "$@"
+}
+
+cli__dump()
+{
+  : ",Dump the dabase"
+  db_dump "$@"
+}
+cli__ls()
+{
+  : "[SECTION],List sections"
+  db_list_sections "$@"
+}
+
+cli__init()
+{
+  : "[PATH],Init new store file"
+  db_create "$@"
+}
+
+cli__db()
+{
+  : "[OPTS],Forward commands to db backend"
+  _db "$GITDB_FILE" "$@"
+}
+
+#####################################
+
+
+
+# Core App
+# =================
+
+# App initialization
+cli_init ()
+{
+  # Useful shortcuts
+  export GIT_DIR=$(git rev-parse --show-toplevel 2>/dev/null)
+  export SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+  export WORK_DIR=${GIT_DIR:-${SCRIPT_DIR:-$PWD}}
+  export PWD_DIR=${PWD}
+
+  # Default settings
+  export APP_DB_DIR=.
+  export APP_DB_NAME=${GITDB_STORE:-info.ini}
+  export APP_DB_PATH=${APP_DB_PATH:-$APP_DB_DIR/$APP_DB_NAME}
+}
+
+# App help message
+cli_usage ()
+{
+  cat <<EOF
+${APP_NAME} is command line tool
+
+usage: ${APP_NAME} [OPTS] COMMAND [ARGS]
+       ${APP_NAME} help
+EOF
+}
+
+# Parse CLI options
+cli_options ()
+{
+  while [[ ! -z "${1:-}" ]]; do
+    # : "parse-opt-start"
+    case "$1" in
+      -s|--store)
+        : "PATH,Set store file path"
+        [[ ! -z "${2:-}" ]] || _die 1 "Missing store path"
+        _log INFO "Use store: $2"
+        APP_DB_PATH=$2 
+        shift 2
+        ;;
+      -h|--help)
+        : ",Show this help message"
+        clish_help cli; 
+        _die 0
+        ;;
+      -n|--dry)
+        : ",Enable dry mode"
+        _log INFO "Dry mode enabled"
+        APP_DRY=true 
+        shift
+        ;;
+      -f|--force)
+        : ",Enable force mode"
+        _log INFO "Force mode enabled"
+        APP_FORCE=true 
+        shift
+        ;;
+      -V|--version)
+        : ",Show version"
+        echo "$APP_VERSION"
+        _die 0
+        ;;
+      -v|--verbose)
+        : "[LEVEL],Set verbosity level"
+        [[ ! -z "${2:-}" ]] || _die 1 "Missing log level value"
+        _log INFO "Log level set to: $2"
+        APP_LOG_LEVEL=$2 
+        shift 2
+        ;;
+      -*)
+        _die 1 "Unknown option: $1"
+        ;;
+      *)
+        args=( "$@" )
+        shift $#
+        
+        # To enable greedy parsing
+        # args+=( "$1" )
+        # shift 1
+      ;;
+    esac
+    # : "parse-opt-stop"
+  done
+}
+
+cli ()
+{
+  # Init
+  trap '_sh_trap_error $? ${LINENO} trap_exit 42' EXIT
+
+  # Parse CLI flags
+  clish_parse_opts cli "$@"
+  set -- "${args[@]}"
+
+  # Route commands before requirements
+  local cmd=${1:-help}
+  shift 1 || true
+  case "$cmd" in
+    -h|--help|help) clish_help cli; return ;;
+    # expl) cli__example "$@"; return ;;
+  esac
+  
+  # Init app
+  cli_init
+  
+  # Define requirements
+  local prog
+  for prog in ${APP_DEPENDENCIES-} ; do
+    _check_bin $prog || {
+      _log ERROR "Command '$prog' must be installed first"
+      return 2
+    }
+  done
+
+  #db_init /run/media/rcordier/JEZBU2/git-annex.ini
+  db_init $APP_DB_PATH
+
+  # Ensure database already exists
+  if [[ "$cmd" != 'init' ]]; then
+    [[ -f "$APP_DB_PATH" ]] ||
+      _die 5 "Store file does not exists: $APP_DB_PATH, please run: $APP_NAME init $APP_DB_PATH"
+  fi
+
+  # Dispatch subcommand
+  clish_dispatch cli__ "$cmd" "$@" \
+    || _die $? "Command '$cmd' returned error: $?"  
+}
+
+cli "${@}"
