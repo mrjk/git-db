@@ -4,6 +4,8 @@ A simple shell script to read and write ini file with git.
 
 ## 💻 Installation
 
+The current latest version is: 0.0.3
+
 ### Dependencies
 
 You need to have git installed.
