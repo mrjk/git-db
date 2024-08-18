@@ -263,12 +263,17 @@ examples:
   $APP_NAME add cars.blue_car.status broken
 
 info:
-  author: $APP_AUTHOR ${APP_EMAIL:+<$APP_EMAIL>}
-  version: ${APP_VERSION:-0.0.1}-${APP_STATUS:-beta}${APP_DATE:+ ($APP_DATE)}
-  license: ${APP_LICENSE:-MIT}
-  website: ${APP_URL}
+  db path:     $APP_DB_PATH
+  author:      $APP_AUTHOR ${APP_EMAIL:+<$APP_EMAIL>}
+  version:     ${APP_VERSION:-0.0.1}-${APP_STATUS:-beta}${APP_DATE:+ ($APP_DATE)}
+  license:     ${APP_LICENSE:-MIT}
+  website:     ${APP_URL}
 EOF
   fi
+
+  #export APP_DB_DIR=.
+  #export APP_DB_NAME=${GITDB_STORE:-info.ini}
+  #export APP_DB_PATH=${APP_DB_PATH:-$APP_DB_DIR/$APP_DB_NAME}
 
 }
 
@@ -444,7 +449,7 @@ cli_init ()
 
   # Default settings
   export APP_DB_DIR=.
-  export APP_DB_NAME=${GITDB_STORE:-info.ini}
+  export APP_DB_NAME=${GITDB_STORE:-db.ini}
   export APP_DB_PATH=${APP_DB_PATH:-$APP_DB_DIR/$APP_DB_NAME}
 }
 
@@ -472,10 +477,10 @@ cli_options ()
         APP_DB_PATH=$2 
         shift 2
         ;;
-      -h|--help)
+      -h|--help|h)
         : ",Show this help message"
-        clish_help cli; 
-        _die 0
+        args=( "help" "$@" )
+        shift
         ;;
       -n|--dry)
         : ",Enable dry mode"
@@ -525,6 +530,9 @@ cli ()
   # Parse CLI flags
   clish_parse_opts cli "$@"
   set -- "${args[@]}"
+  
+  # Init app
+  cli_init
 
   # Route commands before requirements
   local cmd=${1:-help}
@@ -533,9 +541,6 @@ cli ()
     -h|--help|help) clish_help cli; return ;;
     # expl) cli__example "$@"; return ;;
   esac
-  
-  # Init app
-  cli_init
   
   # Define requirements
   local prog
